@@ -191,7 +191,12 @@ public extension DeveloperPortal {
         verboseLog("[SideSign] Parse complete. dsid: \(dsid), token: \(idmsToken)")
 
         // 2FA auth type
-        let statusDictionary = completeResponseDictionary["Status"] as? [String: any Sendable]
+        // `Status` arrives as a plist dictionary, whose generic type is `[AnyHashable: Any]`.
+        // Bridging it with `as? [String: any Sendable]` fails for every real response, so `au`/`hsc`
+        // were always nil and a 2FA challenge (including the 409 "pushed code" case) fell through to
+        // the token-fetch step, which then died on the missing `sk`/`c` keys. Normalise the keys
+        // first, then read.
+        let statusDictionary = normalizedStringKeyedDictionary(completeResponseDictionary["Status"])
         let authType = (statusDictionary?["au"] as? String)
            ?? (completeResponseDictionary["au"] as? String)
            ?? ((statusDictionary?["hsc"] as? Int) == 409 ? "pushedCode" : nil)
@@ -234,28 +239,29 @@ public extension DeveloperPortal {
             case "repair":
                 let directRepairURL = completeResponseDictionary["repairUrl"] as? String
                 let directURL = completeResponseDictionary["url"] as? String
-                let statusURL = (statusDictionary?["url"] as? String)
+                let statusURL = statusDictionary?["url"] as? String
                 let repairURLString = directRepairURL ?? directURL ?? statusURL
                 let repairURL = repairURLString.flatMap { URL(string: $0) } ?? Constants.URLs.developerAccount
 
                 let rawMessage = (statusDictionary?["em"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                let message: String
-                if let rawMessage, !rawMessage.isEmpty {
-                    message = rawMessage
-                } else {
-                    message = Constants.defaultAccountRepairMessage
-                }
+                let message = (rawMessage.flatMap { $0.isEmpty ? nil : $0 }) ?? Constants.defaultAccountRepairMessage
 
                 debugLog("[SideSign] Account repair required: \(message) (url: \(repairURL.absoluteString)). Prompting accountRepairHandler...")
                 let decision = try await accountRepairHandler(repairURL, message)
 
-                if decision == .cancel {
-                    debugLog("[SideSign] Account repair cancelled by caller.")
+                guard decision == .proceed else {
+                    debugLog("[SideSign] Account repair declined by caller.")
                     throw DeveloperPortalError.accountRepairRequired(url: repairURL, message: message)
                 }
 
-                debugLog("[SideSign] Account repair acknowledged by caller. Continuing to fetch app tokens...")
+                // The user has to finish the repair in a browser (accept the new agreement, unlock
+                // the account, reset the password). The response we are holding carries no session
+                // key, so falling through would die on the missing `sk` below and report a cryptic
+                // "missing key 'sk'" instead of "repair your account". Surface the actionable error
+                // and let the caller retry once the repair is actually done -- re-running the SRP
+                // handshake here would just hit `repair` again and cost another Apple round trip.
+                debugLog("[SideSign] Account repair acknowledged; retry after the user repairs the account.")
+                throw DeveloperPortalError.accountRepairRequired(url: repairURL, message: message)
 
             default:
                 break
@@ -353,7 +359,11 @@ public extension DeveloperPortal {
         }
 
         let dictionary = (responseDictionary["Response"] as? [String: any Sendable]) ?? responseDictionary
-        guard let status = dictionary["Status"] as? [String: any Sendable] else {
+        // `Status` is a plist dictionary, which bridges as `[AnyHashable: Any]`; casting it straight
+        // to `[String: any Sendable]` silently fails, so every GrandSlam error (wrong password,
+        // app-specific password required, bad verification code) was reported as a cryptic
+        // "missing key 'Status'" instead of the real Apple message.
+        guard let status = normalizedStringKeyedDictionary(dictionary["Status"]) else {
             let rawStr = prettyJSONString(from: responseDictionary)
             debugLog("[SideSign] Auth endpoint response missing 'Status': \(rawStr)")
             throw ServerError.missingKey(key: "Status", jsonPayload: rawStr)
@@ -462,10 +472,13 @@ public extension DeveloperPortal {
         return FetchedAuthToken(token: authToken, creationDate: now, expirationDate: expirationDate, timeToLive: timeToLive)
     }
 
-    private func parseTrustedPhoneNumbers(from dict: [String: any Sendable]?) -> [TrustedPhoneNumber] {
+    private func parseTrustedPhoneNumbers(from dict: [String: Any]?) -> [TrustedPhoneNumber] {
         var results: [TrustedPhoneNumber] = []
-        let list = (dict?["trustedPhoneNumbers"] as? [[String: any Sendable]])
-                ?? (dict?["phoneNumbers"] as? [[String: any Sendable]])
+        // Values come from a plist through `normalizedStringKeyedDictionary`, so they are `[Any]`,
+        // not `[[String: any Sendable]]` -- the old casts always failed and the phone list fed to
+        // the 2FA dialog was silently empty (users got no number to choose).
+        let list = (dict?["trustedPhoneNumbers"] as? [[String: Any]])
+                ?? (dict?["phoneNumbers"] as? [[String: Any]])
                 ?? []
         for item in list {
             if let id = (item["id"] as? CustomStringConvertible)?.description.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
@@ -476,7 +489,7 @@ public extension DeveloperPortal {
                 results.append(TrustedPhoneNumber(id: id, number: num))
             }
         }
-        if results.isEmpty, let single = dict?["phoneNumber"] as? [String: any Sendable],
+        if results.isEmpty, let single = dict?["phoneNumber"] as? [String: Any],
            let id = (single["id"] as? CustomStringConvertible)?.description.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
             let num = (single["numberWithDialCode"] as? String)
                     ?? (single["obfuscatedNumber"] as? String)
@@ -729,7 +742,7 @@ public extension DeveloperPortal {
         let responseDict = parsePlistOrJSON(data)
         let errorCode = responseDict?["ec"] as? Int ?? 0
         let errorMsg = (responseDict?["em"] as? String)
-                   ?? ((responseDict?["Status"] as? [String: any Sendable])?["em"] as? String)
+                   ?? (normalizedStringKeyedDictionary(responseDict?["Status"])?["em"] as? String)
 
         if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
             || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
@@ -751,13 +764,14 @@ public extension DeveloperPortal {
             throw ServerError.badServerResponse(reason: reason, jsonPayload: rawStr)
         }
 
-        var parsedNumbers = parseTrustedPhoneNumbers(from: responseDict)
+        var parsedNumbers = parseTrustedPhoneNumbers(from: normalizedStringKeyedDictionary(responseDict))
         if parsedNumbers.isEmpty {
             parsedNumbers = knownPhoneNumbers
         }
-        let singlePhoneDict = responseDict?["phoneNumber"] as? [String: any Sendable]
-        let phoneListFirst = (responseDict?["phoneNumbers"] as? [[String: any Sendable]])?.first
-        let trustedPhoneListFirst = (responseDict?["trustedPhoneNumbers"] as? [[String: any Sendable]])?.first
+        let normalizedResponse = normalizedStringKeyedDictionary(responseDict)
+        let singlePhoneDict = normalizedResponse?["phoneNumber"] as? [String: Any]
+        let phoneListFirst = (normalizedResponse?["phoneNumbers"] as? [[String: Any]])?.first
+        let trustedPhoneListFirst = (normalizedResponse?["trustedPhoneNumbers"] as? [[String: Any]])?.first
         let phoneDict = singlePhoneDict ?? phoneListFirst ?? trustedPhoneListFirst
 
         let (xmluiServerPhoneID, xmluiServerMode) = parseXMLUIServerInfo(from: data)
@@ -797,7 +811,14 @@ public extension DeveloperPortal {
     }
 
     private func validateTrustedDevice2FACode(code: String, context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context)
+        // Apple's trusted-device verifier is a **GET** that carries the code in the `security-code`
+        // header. The previous revision sent a bare POST to the same URL with no body: Apple
+        // treats that as an empty/absent code, so a correct code was answered with an
+        // unauthenticated XMLUI page. That failure surfaced as `invalid2FAResponse` and the user
+        // was bounced out of sign-in even though their code was right. It also never recovered
+        // the `X-Apple-PE-Token` response header, which the redirect back to GrandSlam requires.
+        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context)
+        verifyRequest.httpMethod = "GET"
         verifyRequest.setValue(code, forHTTPHeaderField: "security-code")
 
         if let allHeaders = verifyRequest.allHTTPHeaderFields {
@@ -808,6 +829,8 @@ public extension DeveloperPortal {
         let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
         let verifyHttpResponse = verifyResponse as? HTTPURLResponse
         let verifyStatusCode = verifyHttpResponse?.safeStatusCode ?? 0
+
+        verboseLog("[SideSign] validateTrustedDevice2FACode responded HTTP \(verifyStatusCode) (\(verifyData.count) bytes)")
 
         return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: false, httpResponse: verifyHttpResponse)
     }
@@ -844,7 +867,7 @@ public extension DeveloperPortal {
         let verifyDictionary = parsePlistOrJSON(data)
         let (xmluiTitle, xmluiMessage) = parseXMLUIAlertMessage(from: data)
         let errorCode = verifyDictionary?["ec"] as? Int ?? 0
-        let statusDict = verifyDictionary?["Status"] as? [String: any Sendable]
+        let statusDict = normalizedStringKeyedDictionary(verifyDictionary?["Status"])
         let errorMsg = (verifyDictionary?["em"] as? String)
                     ?? (statusDict?["em"] as? String)
                     ?? xmluiMessage
@@ -870,8 +893,13 @@ public extension DeveloperPortal {
 
         if xmluiTitle != nil || xmluiMessage != nil {
             let message = xmluiMessage ?? errorMsg ?? xmluiTitle ?? "Verification failed"
-            debugLog("[SideSign] 2FA verification fatal alert from Apple (HTTP \(statusCode)): \(message)")
-            throw DeveloperPortalError.invalid2FAResponse(cause: message)
+            // An XMLUI alert here is almost always "Incorrect verification code" / "Code expired" --
+            // i.e. a recoverable per-attempt failure, not a dead session. Throwing used to abort the
+            // whole sign-in and discard the user's progress (and the identity token), forcing them
+            // to start over from the Apple ID form. Hand it back to the prompt loop instead; a
+            // genuinely fatal condition still surfaces through the error codes handled above.
+            debugLog("[SideSign] 2FA verification alert from Apple (HTTP \(statusCode)): retryable -> \(message)")
+            return .retry(message: message)
         }
 
         guard statusCode == HTTPStatusCodes.ok else {
@@ -882,9 +910,15 @@ public extension DeveloperPortal {
         }
 
         if requirePeToken {
-            guard httpResponse?.allHeaderFields.keys.contains(where: { ($0 as? String)?.lowercased() == "x-apple-pe-token" }) == true else {
+            // Secondary (SMS / voice) verification must come back with `X-Apple-PE-Token`; without it
+            // the subsequent GrandSlam call is rejected. Keep this a retry: giving the user another
+            // shot with a fresh code is the only recovery Apple offers here.
+            let hasPeToken = httpResponse?.allHeaderFields.keys.contains {
+                String(describing: $0).lowercased() == "x-apple-pe-token"
+            } ?? false
+            guard hasPeToken else {
                 let rawStr = prettyJSONString(from: data)
-                let reason = errorMsg ?? "Incorrect verification code or missing session token"
+                let reason = errorMsg ?? "Verification succeeded but Apple did not issue a session token. Please try again."
                 debugLog("[SideSign] Secondary code verification failed (HTTP \(HTTPStatusCodes.ok) missing PE token header): \(reason) - Body: \(rawStr)")
                 return .retry(message: reason)
             }
@@ -922,6 +956,21 @@ public extension DeveloperPortal {
         ]
         headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         return request
+    }
+
+    /// Converts a bridged plist/JSON container (typically `[AnyHashable: Any]`) into a dictionary
+    /// with `String` keys, so nested values can be read with plain subscripts.
+    private func normalizedStringKeyedDictionary(_ value: Any?) -> [String: Any]? {
+        if let typed = value as? [String: Any] { return typed }
+        if let bridged = value as? [AnyHashable: Any] {
+            var normalized: [String: Any] = [:]
+            for (key, entry) in bridged {
+                guard let stringKey = key as? String else { continue }
+                normalized[stringKey] = entry
+            }
+            return normalized
+        }
+        return nil
     }
 
     private func parsePlistOrJSON(_ data: Data) -> [String: any Sendable]? {
