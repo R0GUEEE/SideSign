@@ -594,7 +594,7 @@ public extension DeveloperPortal {
 
     private func handle2FARequest(isTrustedDevice: Bool,
                             completeResponseDictionary: [String: any Sendable],
-                            statusDictionary: [String: any Sendable]?,
+                            statusDictionary: [String: Any]?,
                             context: TwoFactorAuthContext,
                             verificationHandler: VerificationHandler?,
                             codeAlreadySent: Bool = false) async throws
